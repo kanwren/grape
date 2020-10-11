@@ -1,0 +1,49 @@
+cabal-version: 2.4
+
+name:
+  grape
+version:
+  0.1.0.0
+-- synopsis:
+-- description:
+-- bug-reports:
+license:
+  MIT
+license-file:
+  LICENSE
+author:
+  nprindle
+maintainer:
+  nprindle18@gmail.com
+-- copyright:
+category:
+  Web
+extra-source-files:
+  CHANGELOG.md
+
+executable grape
+  main-is:
+    Main.hs
+  other-modules:
+  build-depends:
+    , base ^>=4.14.1.0
+    , aeson
+    , async
+    , bytestring
+    , lens
+    , modern-uri
+    , optparse-applicative
+    , req
+    , text
+    , time
+    , xml-html-conduit-lens
+  hs-source-dirs:
+    app
+  default-language:
+    Haskell2010
+  ghc-options:
+    -Wall
+    -O2
+    -rtsopts
+    -threaded
+
