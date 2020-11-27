@@ -1,40 +1,28 @@
-{-# language DataKinds #-}
-{-# language DeriveAnyClass #-}
 {-# language DeriveGeneric #-}
-{-# language DerivingStrategies #-}
-{-# language ImportQualifiedPost #-}
 {-# language LambdaCase #-}
 {-# language OverloadedStrings #-}
-{-# language RecordWildCards #-}
 {-# language TypeApplications #-}
 
 module Main (main) where
 
+import Control.Concurrent
+import Control.Exception
 import Data.Char (isUpper, toLower)
 import Data.Fixed (Centi)
-import Data.List (stripPrefix)
-import Data.Maybe (fromMaybe)
 import Data.Traversable (for)
 import GHC.Generics (Generic)
+import System.Environment (getArgs)
 import Text.Read (readMaybe)
-
-import Data.Text (Text)
-import Data.Text qualified as Text
-import Data.ByteString (ByteString)
 
 import Control.Concurrent.Async (forConcurrently)
 import Control.Lens
-import Data.Aeson qualified as Aeson
+import qualified Data.Aeson as Aeson
+import Data.ByteString (ByteString)
+import Data.Text (Text)
+import qualified Data.Text as Text
 import Network.HTTP.Req ((=:), (/:))
-import Network.HTTP.Req qualified as Req
-import Options.Applicative
-import Text.Xml.Lens qualified as X
-
-httpCfg :: Req.HttpConfig
-httpCfg = Req.defaultHttpConfig
-
-baseURI :: Req.Url 'Req.Https
-baseURI = Req.https "www.webscraper.io" /: "test-sites" /: "e-commerce" /: "static" /: "computers" /: "laptops"
+import qualified Network.HTTP.Req as Req
+import qualified Text.Xml.Lens as X
 
 getPage :: Int -> IO (Either String ByteString)
 getPage p = Req.runReq httpCfg $ do
@@ -43,6 +31,9 @@ getPage p = Req.runReq httpCfg $ do
   if statusCode == 200
     then pure $ Right $ Req.responseBody r
     else pure $ Left $ "Unexpected error code: " <> show statusCode
+  where
+    httpCfg = Req.defaultHttpConfig
+    baseURI = Req.https "www.webscraper.io" /: "test-sites" /: "e-commerce" /: "static" /: "computers" /: "laptops"
 
 data Laptop = Laptop
   { laptopName :: !Text
@@ -50,7 +41,7 @@ data Laptop = Laptop
   , laptopDescription :: !Text
   , laptopStars :: !Int
   }
-  deriving stock (Show, Generic)
+  deriving (Show, Generic)
 
 toSnake :: String -> String
 toSnake s = s & _head %~ toLower & _tail %~ snakeRest
@@ -62,7 +53,7 @@ toSnake s = s & _head %~ toLower & _tail %~ snakeRest
 
 instance Aeson.ToJSON Laptop where
   toJSON = Aeson.genericToJSON Aeson.defaultOptions
-    { Aeson.fieldLabelModifier = \f -> toSnake $ fromMaybe f $ stripPrefix "laptop" f
+    { Aeson.fieldLabelModifier = toSnake . drop (Text.length "laptop")
     }
 
 scrapePage :: ByteString -> Maybe [Laptop]
@@ -88,34 +79,44 @@ scrapePage page = do
       , laptopStars = stars
       }
 
-data Args = Args
-  { argsOutFile :: FilePath
-  }
+data ChanMsg a = Msg a | CloseChan
 
-parseArgs :: IO Args
-parseArgs = customExecParser parserPrefs $ info (args <**> helper) mempty
-  where
-    parserPrefs = prefs showHelpOnEmpty
-    args = Args
-      <$> do strOption $ short 'o' <> long "out" <> metavar "OUT" <> help "JSON file to write results to"
+worker :: (a -> IO ()) -> IO (Chan (ChanMsg a))
+worker f = do
+  c <- newChan
+  let go = readChan c >>= \case
+        CloseChan -> pure ()
+        Msg x     -> f x *> go
+  _ <- forkIO go
+  pure c
+
+send :: Chan (ChanMsg a) -> a -> IO ()
+send c x = writeChan c (Msg x)
+
+close :: Chan (ChanMsg a) -> IO ()
+close c = writeChan c CloseChan
+
+withWorker :: (a -> IO ()) -> (Chan (ChanMsg a) -> IO b) -> IO b
+withWorker f = bracket (worker f) close
 
 main :: IO ()
 main = do
-  Args{..} <- parseArgs
+  [outFile] <- getArgs
   let pages = [1..20]
   -- if we had more than 20 pages, only open 100 at a time to prevent too many
   -- open connections
   let chunksOf n = takeWhile (not . null) . fmap (take n) . iterate (drop n)
-  scores <- fmap concat $ for (chunksOf 100 pages) $ \pageRange -> do
-    fmap concat $ forConcurrently pageRange $ \page -> do
-      res <- fmap scrapePage <$> getPage page
-      case res of
-        Left err -> do
-          putStrLn $ "Error when fetching page " <> show page <> ": " <> err
-          pure []
-        Right Nothing -> do
-          putStrLn $ "Error when scraping data from page " <> show page
-          pure []
-        Right (Just scores) -> pure scores
-  Aeson.encodeFile argsOutFile scores
+  scores <- withWorker putStrLn $ \logger -> do
+    fmap concat $ for (chunksOf 100 pages) $ \pageRange -> do
+      fmap concat $ forConcurrently pageRange $ \page -> do
+        res <- fmap scrapePage <$> getPage page
+        case res of
+          Left err -> do
+            send logger $ "Error when fetching page " <> show page <> ": " <> err
+            pure []
+          Right Nothing -> do
+            send logger $ "Error when scraping data from page " <> show page
+            pure []
+          Right (Just scores) -> pure scores
+  Aeson.encodeFile outFile scores
 
